@@ -199,6 +199,23 @@ def send_error_notification(exc: Exception) -> None:
         print(f"  [ERROR] Failed to send Telegram error notification: {notify_exc}")
 
 
+def send_startup_notification() -> bool:
+    """Send the startup Telegram message. Returns True on success."""
+    if not telegram_enabled():
+        return True
+
+    send_telegram_notification(
+        "PredictionMLBot Started",
+        (
+            f"Time (UTC):           {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Telegram chat:        {TELEGRAM_CHAT_ID}\n"
+            f"Thresholds:           mag >= {MAG_PROBA_THR:.0%}, dir >= {DIR_CONF_THR:.0%}\n"
+            f"Status:               Scheduler started and waiting for the next 5-minute boundary."
+        ),
+    )
+    return True
+
+
 def send_email(subject: str, body: str) -> None:
     """Send a plain-text email via SMTP/TLS."""
     msg = MIMEText(body, "plain")
@@ -342,22 +359,22 @@ def main():
     m = load_models()
     print("Models loaded. Waiting for next 5-min boundary...\n")
 
-    if telegram_enabled():
+    startup_notification_sent = not telegram_enabled()
+    if not startup_notification_sent:
         try:
-            send_telegram_notification(
-                "PredictionMLBot Started",
-                (
-                    f"Time (UTC):           {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Telegram chat:        {TELEGRAM_CHAT_ID}\n"
-                    f"Thresholds:           mag >= {MAG_PROBA_THR:.0%}, dir >= {DIR_CONF_THR:.0%}\n"
-                    f"Status:               Scheduler started and waiting for the next 5-minute boundary."
-                ),
-            )
+            startup_notification_sent = send_startup_notification()
             print("Startup Telegram notification sent.")
         except Exception as exc:
             print(f"  [ERROR] Failed to send startup Telegram notification: {exc}")
 
     while True:
+        if not startup_notification_sent:
+            try:
+                startup_notification_sent = send_startup_notification()
+                print("Startup Telegram notification retry sent.")
+            except Exception as exc:
+                print(f"  [ERROR] Failed to resend startup Telegram notification: {exc}")
+
         wait = seconds_until_next_boundary()
         next_run = datetime.datetime.utcnow() + datetime.timedelta(seconds=wait)
         print(f"  Next run at ~{next_run.strftime('%H:%M:%S')} UTC  (sleeping {wait:.0f}s)")
