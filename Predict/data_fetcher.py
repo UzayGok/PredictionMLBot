@@ -25,6 +25,7 @@ import requests
 
 BASE_URL = "https://api.binance.com"
 KLINES_ENDPOINT = "/api/v3/klines"
+TIME_ENDPOINT = "/api/v3/time"
 
 _BINANCE_COLUMNS = [
     "timestamp", "open", "high", "low", "close", "volume",
@@ -33,18 +34,37 @@ _BINANCE_COLUMNS = [
 ]
 
 
+def _binance_server_utc() -> datetime.datetime:
+    """Return the current Binance server time as a timezone-aware UTC datetime."""
+    response = requests.get(BASE_URL + TIME_ENDPOINT, timeout=5)
+    response.raise_for_status()
+    server_ms = response.json()["serverTime"]
+    return datetime.datetime.fromtimestamp(server_ms / 1000, tz=datetime.timezone.utc)
+
+
 def current_boundary_utc() -> datetime.datetime:
-    """Return the current UTC 5-minute boundary as a naive UTC datetime."""
-    now = datetime.datetime.utcnow()
+    """
+    Return the current UTC 5-minute boundary.
+
+    Prefer Binance server time so candle selection stays aligned with the
+    exchange even if the local machine clock drifts. Fall back to local UTC
+    if the server-time request fails.
+    """
+    try:
+        now = _binance_server_utc()
+    except (requests.RequestException, KeyError, ValueError):
+        now = datetime.datetime.now(datetime.timezone.utc)
     return now.replace(second=0, microsecond=0, minute=(now.minute // 5) * 5)
 
 
 def _boundary_to_ms(boundary: datetime.datetime) -> int:
     """
-    Convert a naive UTC datetime to milliseconds timestamp.
+    Convert a UTC datetime to milliseconds timestamp.
     Uses calendar.timegm() to avoid local-timezone contamination
     that datetime.timestamp() would introduce.
     """
+    if boundary.tzinfo is not None:
+        boundary = boundary.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return calendar.timegm(boundary.timetuple()) * 1000
 
 
@@ -61,7 +81,8 @@ def fetch_candles(
     ----------
     symbol   : Binance trading pair, e.g. "BTCUSDT"
     interval : Kline interval, e.g. "5m"
-    limit    : Number of candles to fetch (max 1000 per Binance docs)
+    limit    : Number of candles to fetch. Requests are paginated in chunks
+               of up to 1000 candles to satisfy larger lookbacks.
 
     Returns
     -------
@@ -72,26 +93,48 @@ def fetch_candles(
     The last row is the most recently completed candle at the current
     5-minute boundary.
     """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+
     boundary = current_boundary_utc()
-    end_time_ms = _boundary_to_ms(boundary)
+    end_time_ms = _boundary_to_ms(boundary) - 1
+    batches = []
+    remaining = limit
 
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        # Subtract 1ms so the in-progress candle (which opens exactly at the
-        # boundary) is excluded. Only fully completed candles are returned.
-        "endTime": end_time_ms - 1,
-        "limit": limit,
-    }
+    while remaining > 0:
+        batch_limit = min(1000, remaining)
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            # Subtract 1ms so the in-progress candle (which opens exactly at the
+            # boundary) is excluded. Only fully completed candles are returned.
+            "endTime": end_time_ms,
+            "limit": batch_limit,
+        }
 
-    response = requests.get(
-        BASE_URL + KLINES_ENDPOINT,
-        params=params,
-        timeout=10,
-    )
-    response.raise_for_status()
+        response = requests.get(
+            BASE_URL + KLINES_ENDPOINT,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
 
-    df = pd.DataFrame(response.json(), columns=_BINANCE_COLUMNS)
+        payload = response.json()
+        if not payload:
+            break
+
+        batches.append(pd.DataFrame(payload, columns=_BINANCE_COLUMNS))
+        remaining -= len(payload)
+        end_time_ms = int(payload[0][0]) - 1
+
+        if len(payload) < batch_limit:
+            break
+
+    if not batches:
+        raise ValueError("Binance returned no candles")
+
+    df = pd.concat(reversed(batches), ignore_index=True)
+    df = df.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
 
     # Use quote_volume (USDT) as "volume" — this matches the training data,
     # which used quote asset volume (millions of USDT), not base volume (BTC).

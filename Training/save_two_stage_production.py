@@ -1,11 +1,10 @@
 """
 save_two_stage_production.py
 Save the two-stage production system:
-  Stage 1: OLD magnitude LGB (45 direction features, old params)
-  Stage 2: B2 stacking direction model (LGB + XGB + RF → LogReg meta)
+  Stage 1: OLD magnitude LGB (45 DIRECTION_FEATURES, old params)
+  Stage 2: B2 stacking direction model (LGB + XGB + RF → LogReg meta, 55 STACKING_FEATURES)
   Thresholds: mag_proba >= 0.5, dir_conf >= 0.55
-  OOS result: 57.81% accuracy on 896 trades out of 47,784 (1.9%)
-"""
+  OOS result (Top 55): ~58.68% on 1060 trades across all 6 test sets"""
 import os, sys, pickle
 import numpy as np, pandas as pd
 import lightgbm as lgb
@@ -19,7 +18,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 from Training.features import (
     calculate_features, make_label, make_label_large_moves,
-    DIRECTION_FEATURES,
+    DIRECTION_FEATURES, STACKING_FEATURES,
 )
 
 PCT_THR = 0.0372654293444779
@@ -58,25 +57,28 @@ def main():
     full["next_abs_return"] = full["next_return_pct"].abs()
     full["direction_label"] = make_label(full)
     full["lm_label"] = make_label_large_moves(full, PCT_THR)
-    full = full.dropna(subset=DIRECTION_FEATURES + ["direction_label", "next_return_pct"]).reset_index(drop=True)
+    # Drop rows missing any feature needed by either model
+    all_feats = list(set(DIRECTION_FEATURES + STACKING_FEATURES))
+    full = full.dropna(subset=all_feats + ["direction_label", "next_return_pct"]).reset_index(drop=True)
     print(f"Training samples: {len(full):,}")
 
-    feats = DIRECTION_FEATURES  # same 45 features for both models
+    mag_feats = DIRECTION_FEATURES   # 45 features — DO NOT CHANGE
+    dir_feats = STACKING_FEATURES    # 55 stacking-optimised features
 
     # ---- Stage 1: Magnitude model ----
-    print("\nTraining magnitude model...")
+    print("\nTraining magnitude model (45 DIRECTION_FEATURES)...")
     mag_scaler = StandardScaler()
-    X_mag = mag_scaler.fit_transform(full[feats])
+    X_mag = mag_scaler.fit_transform(full[mag_feats])
     y_mag = (full["next_abs_return"] > MAG_THRESHOLD).astype(int).values
     mag_model = lgb.LGBMClassifier(**MAG_PARAMS)
     mag_model.fit(X_mag, y_mag)
     print(f"  Big move rate: {y_mag.mean():.2%}")
 
     # ---- Stage 2: B2 stacking direction model ----
-    print("Training B2 stacking direction model...")
+    print("Training B2 stacking direction model (55 STACKING_FEATURES)...")
     train_lm = full.dropna(subset=["lm_label"]).reset_index(drop=True)
     dir_scaler = StandardScaler()
-    X_dir = dir_scaler.fit_transform(train_lm[feats])
+    X_dir = dir_scaler.fit_transform(train_lm[dir_feats])
     y_dir = train_lm["lm_label"].values
 
     # 70/30 split for meta-learner
@@ -127,17 +129,17 @@ def main():
         t = pd.read_csv(p)
         t = calculate_features(t)
         t["direction_label"] = make_label(t)
-        t = t.dropna(subset=feats + ["direction_label"]).reset_index(drop=True)
+        t = t.dropna(subset=dir_feats + ["direction_label"]).reset_index(drop=True)
         test_dfs.append(t)
     test_df = pd.concat(test_dfs, ignore_index=True)
     print(f"Test samples: {len(test_df):,}")
 
     # Mag predictions
-    Xt_mag = mag_scaler.transform(test_df[feats])
+    Xt_mag = mag_scaler.transform(test_df[mag_feats])
     mag_proba = mag_model.predict_proba(Xt_mag)[:, 1]
 
     # Dir predictions (B2 stacking)
-    Xt_dir = dir_scaler.transform(test_df[feats])
+    Xt_dir = dir_scaler.transform(test_df[dir_feats])
     meta_test = np.column_stack([
         d_lgb_full.predict_proba(Xt_dir)[:, 1],
         d_xgb_full.predict_proba(Xt_dir)[:, 1],
@@ -189,12 +191,14 @@ def main():
     pickle.dump(d_rf_full, open(os.path.join(md, "dir_rf.pkl"), "wb"))
     pickle.dump(meta_clf, open(os.path.join(md, "dir_meta.pkl"), "wb"))
     pickle.dump(dir_scaler, open(os.path.join(md, "dir_scaler.pkl"), "wb"))
-    pickle.dump(feats, open(os.path.join(md, "features.pkl"), "wb"))
+    pickle.dump(mag_feats, open(os.path.join(md, "mag_features.pkl"), "wb"))  # 45 DIRECTION_FEATURES
+    pickle.dump(dir_feats, open(os.path.join(md, "features.pkl"), "wb"))      # 55 STACKING_FEATURES
 
     config = {
         "mag_params": MAG_PARAMS,
         "dir_params": DIR_PARAMS,
-        "features": feats,
+        "mag_features": mag_feats,
+        "dir_features": dir_feats,
         "mag_threshold": MAG_THRESHOLD,
         "mag_proba_thr": MAG_PROBA_THR,
         "dir_conf_thr": DIR_CONF_THR,
@@ -203,9 +207,9 @@ def main():
     pickle.dump(config, open(os.path.join(md, "two_stage_config.pkl"), "wb"))
 
     print(f"  Saved to {md}/:")
-    print(f"    mag_model.pkl, mag_scaler.pkl")
+    print(f"    mag_model.pkl, mag_scaler.pkl, mag_features.pkl ({len(mag_feats)} features)")
     print(f"    dir_lgb.pkl, dir_xgb.pkl, dir_rf.pkl, dir_meta.pkl, dir_scaler.pkl")
-    print(f"    features.pkl ({len(feats)} features)")
+    print(f"    features.pkl ({len(dir_feats)} STACKING_FEATURES)")
     print(f"    two_stage_config.pkl")
     print(f"\n  Thresholds: mag>={MAG_PROBA_THR}, dir>={DIR_CONF_THR}")
     print(f"  OOS: {acc*100:.2f}% on {n:,} trades")

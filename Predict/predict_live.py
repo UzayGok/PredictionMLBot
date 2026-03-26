@@ -28,21 +28,21 @@ from Training.features import calculate_features
 
 MAG_PROBA_THR = 0.50
 DIR_CONF_THR = 0.55
+LIVE_CANDLE_LIMIT = 2500
 
 
-def predict_two_stage(df, mag_model, mag_scaler, dir_models, dir_scaler, features):
+def predict_two_stage(df, mag_model, mag_scaler, mag_features,
+                       dir_models, dir_scaler, dir_features):
     """
     Two-stage prediction on the last row.
     Returns dict with signal, mag_proba, dir_conf, trade flag.
     """
-    row = df[features].iloc[[-1]]
-
-    # Stage 1: magnitude
-    mag_scaled = mag_scaler.transform(row)
+    # Stage 1: magnitude (45 DIRECTION_FEATURES)
+    mag_scaled = mag_scaler.transform(df[mag_features].iloc[[-1]])
     mag_proba = mag_model.predict_proba(mag_scaled)[0][1]  # P(big move)
 
-    # Stage 2: direction (B2 stacking)
-    dir_scaled = dir_scaler.transform(row)
+    # Stage 2: direction (55 STACKING_FEATURES)
+    dir_scaled = dir_scaler.transform(df[dir_features].iloc[[-1]])
     d_lgb, d_xgb, d_rf, meta_clf = dir_models
     meta = np.array([[
         d_lgb.predict_proba(dir_scaled)[0][1],
@@ -84,14 +84,20 @@ def main():
     d_rf = pickle.load(open(os.path.join(models_dir, "dir_rf.pkl"), "rb"))
     meta_clf = pickle.load(open(os.path.join(models_dir, "dir_meta.pkl"), "rb"))
     dir_scaler = pickle.load(open(os.path.join(models_dir, "dir_scaler.pkl"), "rb"))
-    features = pickle.load(open(os.path.join(models_dir, "features.pkl"), "rb"))
+    mag_features = pickle.load(open(os.path.join(models_dir, "mag_features.pkl"), "rb"))
+    dir_features = pickle.load(open(os.path.join(models_dir, "features.pkl"), "rb"))
 
     dir_models = (d_lgb, d_xgb, d_rf, meta_clf)
 
-    # Fetch candles
-    df = fetch_candles(limit=250)
+    # Fetch enough history to satisfy the longest rolling features.
+    df = fetch_candles(limit=LIVE_CANDLE_LIMIT)
     df = calculate_features(df)
-    df = df.dropna().reset_index(drop=True)
+    required = list(set(mag_features + dir_features))
+    df = df.dropna(subset=required).reset_index(drop=True)
+    if df.empty:
+        raise ValueError(
+            "No valid rows after feature calculation. Try increasing LIVE_CANDLE_LIMIT."
+        )
 
     # Candle timing
     last_candle_open = df["timestamp"].iloc[-1]
@@ -101,7 +107,8 @@ def main():
 
     # Two-stage prediction
     result = predict_two_stage(
-        df, mag_model, mag_scaler, dir_models, dir_scaler, features
+        df, mag_model, mag_scaler, mag_features,
+        dir_models, dir_scaler, dir_features
     )
 
     # Display

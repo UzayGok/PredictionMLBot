@@ -255,7 +255,8 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Hour of day (UTC) — volatility varies by trading session
     if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], format="%Y-%m-%d %H:%M:%S")
+        # Handle both string timestamps (CSV) and datetime objects (live fetch)
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df["hour_of_day"] = ts.dt.hour
         df["is_us_session"] = ((ts.dt.hour >= 13) & (ts.dt.hour <= 21)).astype(int)
         df["is_asia_session"] = ((ts.dt.hour >= 0) & (ts.dt.hour <= 8)).astype(int)
@@ -313,6 +314,7 @@ FEATURE_COLS = [
 ]
 
 # Features used by the direction model (original top 45 from ablation)
+# Also used by the magnitude model — do NOT change
 DIRECTION_FEATURES = [
     "lag_return_5", "body_ratio", "return_24h", "trend_strength_24h",
     "lag_return_3", "atr_regime", "high_low_ratio", "lag_volume_ratio_2",
@@ -325,6 +327,26 @@ DIRECTION_FEATURES = [
     "num_trades", "log_return_20", "ema_slope_10", "lag_rsi_3",
     "range_pos_12", "return_4h", "price_range", "williams_r",
     "lag_rsi_1", "rsi_14", "macd_signal", "bb_pct", "log_return_50",
+]
+
+# Features used by the stacking direction model (top 55 from stacking-aware re-selection)
+# Better OOS generalisation than DIRECTION_FEATURES: +0.60% accuracy, +18% more trades
+STACKING_FEATURES = [
+    "lag_return_1", "high_low_ratio", "return_24h", "range_pos_12",
+    "lag_return_5", "body_ratio", "lag_rsi_1", "lag_volume_ratio_2",
+    "lag_return_3", "lag_return_2", "trend_strength_24h", "ema_slope_10",
+    "upper_wick_ratio", "range_expansion", "lower_wick_ratio",
+    "lag_volume_ratio_1", "volume_trend_1h_24h", "macd_diff",
+    "lag_return_10", "log_return_5", "rsi_1h", "ema_slope_20",
+    "williams_r", "price_vs_vwap_24h", "atr_regime", "volume_ratio",
+    "ema_slope_5", "bb_pct", "atr_1h", "rsi_14", "vol_percentile_week",
+    "volume_ratio_60", "range_pos_48", "vol_expansion", "num_trades",
+    "vol_ratio_10_50", "price_change_pct", "volume_acceleration",
+    "lag_volume_ratio_3", "volume", "volatility_50", "volatility_20",
+    "return_1h", "gap_pct", "momentum_10", "price_vs_ema_20",
+    "lag_rsi_3", "volume_sma", "price_change", "log_return_10",
+    "return_4h", "log_return_3", "price_range", "log_return_20",
+    "macd_signal",
 ]
 
 
