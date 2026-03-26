@@ -296,7 +296,7 @@ def run_prediction(m: dict) -> None:
         if telegram_enabled():
             try:
                 send_telegram_notification(
-                    f"SKIP {result['signal']}",
+                    f"SKIP, {result['signal']}, {result['dir_conf']:.2%}",
                     "",
                 )
                 print(f"           Telegram skip sent → chat {TELEGRAM_CHAT_ID}")
