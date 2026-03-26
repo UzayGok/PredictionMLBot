@@ -72,10 +72,11 @@ def fetch_candles(
     symbol: str = "BTCUSDT",
     interval: str = "5m",
     limit: int = 100,
+    boundary: datetime.datetime | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch the latest `limit` completed klines ending at the current UTC
-    5-minute boundary.
+    Fetch the latest `limit` completed klines ending at the given UTC
+    5-minute boundary (defaults to the current boundary).
 
     Parameters
     ----------
@@ -83,6 +84,8 @@ def fetch_candles(
     interval : Kline interval, e.g. "5m"
     limit    : Number of candles to fetch. Requests are paginated in chunks
                of up to 1000 candles to satisfy larger lookbacks.
+    boundary : The 5-minute boundary to align to. If None, queries Binance
+               server time to determine it.
 
     Returns
     -------
@@ -90,13 +93,14 @@ def fetch_candles(
         timestamp (UTC-aware datetime), open, high, low, close,
         volume (float), num_trades (int)
 
-    The last row is the most recently completed candle at the current
+    The last row is the most recently completed candle at the given
     5-minute boundary.
     """
     if limit <= 0:
         raise ValueError("limit must be positive")
 
-    boundary = current_boundary_utc()
+    if boundary is None:
+        boundary = current_boundary_utc()
     end_time_ms = _boundary_to_ms(boundary) - 1
     batches = []
     remaining = limit

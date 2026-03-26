@@ -29,3 +29,4 @@ env/
 *.pkl
 data/
 *.log
+.poly_creds.json

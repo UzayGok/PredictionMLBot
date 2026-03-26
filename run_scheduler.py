@@ -16,6 +16,7 @@ import sys
 import time
 import traceback
 import atexit
+import threading
 from email.mime.text import MIMEText
 
 from dotenv import load_dotenv
@@ -29,11 +30,18 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 from Predict.data_fetcher import fetch_candles, current_boundary_utc
 from Training.features import calculate_features
 from Predict.predict_live import predict_two_stage, MAG_PROBA_THR, DIR_CONF_THR, LIVE_CANDLE_LIMIT
+from Trade.order import place_btc_5m_order, warm_client
+from Trade.auth import get_clob_client
+from Trade.market import get_btc_5m_market
 
 # Notification config from .env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALLOWED_TELEGRAM_CHAT_IDS = {TELEGRAM_CHAT_ID} if TELEGRAM_CHAT_ID else set()
+
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").strip().lower() == "true"
+TRADE_PRICE = float(os.getenv("TRADE_PRICE", "0.50"))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
 
 EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "false").strip().lower() == "true"
 EMAIL_TO = os.getenv("EMAIL_TO", "").strip()
@@ -77,6 +85,13 @@ def configure_logging() -> None:
     atexit.register(file_stream.close)
     sys.stdout = TeeStream(file_stream, sys.stdout)
     sys.stderr = TeeStream(file_stream, sys.stderr)
+
+    # Elevate process priority so the bot gets CPU time promptly
+    try:
+        import psutil
+        psutil.Process().nice(psutil.HIGH_PRIORITY_CLASS)
+    except Exception:
+        pass
 
 
 def acquire_single_instance_lock() -> bool:
@@ -179,6 +194,18 @@ def send_telegram_notification(subject: str, body: str) -> None:
     send_telegram_message(subject, body)
 
 
+def send_telegram_async(subject: str, body: str) -> None:
+    """Fire-and-forget Telegram notification in a background thread."""
+    if not telegram_enabled():
+        return
+    def _send():
+        try:
+            send_telegram_message(subject, body)
+        except Exception as exc:
+            print(f"           [ERROR] Telegram async failed: {exc}")
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def send_error_notification(exc: Exception) -> None:
     """Send a concise Telegram alert when the scheduler hits an error."""
     if not telegram_enabled():
@@ -254,9 +281,41 @@ def load_models():
     }
 
 
-def run_prediction(m: dict) -> None:
+CANDLE_POLL_RETRIES = 20   # max retries waiting for fresh candle
+CANDLE_POLL_INTERVAL = 1.0  # seconds between retries
+
+
+def _wait_for_fresh_candle(target_boundary: datetime.datetime) -> None:
+    """Poll Binance until the candle boundary has advanced to target_boundary.
+
+    The scheduler computes target_boundary BEFORE sleeping (the next 5-min mark).
+    We poll until current_boundary_utc() (Binance server time) reports that
+    boundary, which proves the previous candle has been finalised.
+
+    Parameters
+    ----------
+    target_boundary : datetime.datetime
+        The 5-minute boundary we expect Binance to have reached
+        (e.g. 12:45:00 UTC).
+    """
+    for attempt in range(1, CANDLE_POLL_RETRIES + 1):
+        try:
+            boundary_now = current_boundary_utc()
+            if boundary_now >= target_boundary:
+                print(f"  Candle ready (attempt {attempt}, "
+                      f"boundary: {boundary_now.strftime('%H:%M:%S')})")
+                return
+        except Exception:
+            pass
+        time.sleep(CANDLE_POLL_INTERVAL)
+    print(f"  [WARN] Candle not ready after {CANDLE_POLL_RETRIES} retries — proceeding anyway")
+
+
+def run_prediction(m: dict, target_boundary: datetime.datetime) -> None:
     """Fetch candles, predict, print, and notify if trade."""
-    df = fetch_candles(limit=LIVE_CANDLE_LIMIT)
+    _wait_for_fresh_candle(target_boundary)
+
+    df = fetch_candles(limit=LIVE_CANDLE_LIMIT, boundary=target_boundary)
     df = calculate_features(df)
     required = list(set(m["mag_features"] + m["dir_features"]))
     df = df.dropna(subset=required).reset_index(drop=True)
@@ -270,6 +329,9 @@ def run_prediction(m: dict) -> None:
     pred_open = candle_close
     pred_close = pred_open + datetime.timedelta(minutes=5)
     price = df["close"].iloc[-1]
+
+    # Deterministic boundary epoch from candle data (immune to local clock drift)
+    pred_boundary_epoch = int(pred_open.timestamp())
 
     result = predict_two_stage(
         df,
@@ -296,12 +358,36 @@ def run_prediction(m: dict) -> None:
             result,
         )
 
-        if telegram_enabled():
+        # --- SPEED: Place order FIRST, notify after ---
+        if TRADING_ENABLED:
             try:
-                send_telegram_notification(subject, body)
-                print(f"           Telegram sent → chat {TELEGRAM_CHAT_ID}")
+                order = place_btc_5m_order(
+                    direction=result['signal'],
+                    price=TRADE_PRICE,
+                    size=TRADE_SIZE,
+                    boundary_epoch=pred_boundary_epoch,
+                )
+                order_resp = order['response']
+                print(f"           Order placed → {order['direction']} @ ${order['price']:.2f} x {order['size']:.0f}")
+                print(f"           Market: {order['market_slug']}")
+                print(f"           Order ID: {order_resp.get('orderID', 'N/A')}  Status: {order_resp.get('status', 'N/A')}")
+                # Non-blocking Telegram notification for order
+                order_body = (
+                    f"Direction:            {order['direction']}\n"
+                    f"Price:                ${order['price']:.2f}\n"
+                    f"Shares:               {order['size']:.0f}\n"
+                    f"Market:               {order['market_slug']}\n"
+                    f"Order ID:             {order_resp.get('orderID', 'N/A')}\n"
+                    f"Status:               {order_resp.get('status', 'N/A')}"
+                )
+                send_telegram_async("Order Placed", order_body)
             except Exception as exc:
-                print(f"           [ERROR] Telegram failed: {exc}")
+                print(f"           [ERROR] Order placement failed: {exc}")
+                send_telegram_async("Order FAILED", str(exc))
+
+        # Non-blocking BET notification
+        send_telegram_async(subject, body)
+        print(f"           Telegram queued → chat {TELEGRAM_CHAT_ID}")
 
         if email_enabled():
             try:
@@ -311,22 +397,25 @@ def run_prediction(m: dict) -> None:
                 print(f"           [ERROR] Email failed: {exc}")
     else:
         if telegram_enabled():
-            try:
-                send_telegram_notification(
-                    f"SKIP, {result['signal']}, {result['dir_conf']:.2%}",
-                    "",
-                )
-                print(f"           Telegram skip sent → chat {TELEGRAM_CHAT_ID}")
-            except Exception as exc:
-                print(f"           [ERROR] Telegram skip failed: {exc}")
+            mag_label = "BIG" if result['mag_proba'] >= MAG_PROBA_THR else "SMALL"
+            send_telegram_async(
+                f"{mag_label}, SKIP, {result['signal']}, {result['dir_conf']:.2%}",
+                "",
+            )
+            print(f"           Telegram skip queued → chat {TELEGRAM_CHAT_ID}")
 
 
-def seconds_until_next_boundary() -> float:
-    """Seconds until the next Binance 5-minute boundary plus a small buffer."""
+def next_boundary_info() -> tuple:
+    """Return (seconds_to_wait, target_boundary_utc).
+
+    target_boundary is the NEXT 5-minute mark we want to wake up at.
+    This is computed once and threaded through _wait_for_fresh_candle()
+    so we never re-query Binance server time independently.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
-    target = current_boundary_utc() + datetime.timedelta(minutes=5, seconds=5)
+    target = current_boundary_utc() + datetime.timedelta(minutes=5)
     wait = (target - now).total_seconds()
-    return max(wait, 1)
+    return max(wait, 1), target
 
 
 def main():
@@ -357,7 +446,17 @@ def main():
 
     print("Loading models...")
     m = load_models()
-    print("Models loaded. Waiting for next 5-min boundary...\n")
+    print("Models loaded.")
+
+    if TRADING_ENABLED:
+        print("Warming CLOB client...")
+        try:
+            warm_client()
+            print("CLOB client ready.")
+        except Exception as exc:
+            print(f"  [WARN] CLOB client warm-up failed: {exc}")
+
+    print("Waiting for next 5-min boundary...\n")
 
     startup_notification_sent = not telegram_enabled()
     if not startup_notification_sent:
@@ -367,6 +466,8 @@ def main():
         except Exception as exc:
             print(f"  [ERROR] Failed to send startup Telegram notification: {exc}")
 
+    last_cycle_mono = time.monotonic()
+
     while True:
         if not startup_notification_sent:
             try:
@@ -375,13 +476,33 @@ def main():
             except Exception as exc:
                 print(f"  [ERROR] Failed to resend startup Telegram notification: {exc}")
 
-        wait = seconds_until_next_boundary()
+        wait, target_boundary = next_boundary_info()
         next_run = datetime.datetime.utcnow() + datetime.timedelta(seconds=wait)
         print(f"  Next run at ~{next_run.strftime('%H:%M:%S')} UTC  (sleeping {wait:.0f}s)")
         time.sleep(wait)
 
+        # Detect resume from sleep/hibernation (gap > 10 min)
+        now_mono = time.monotonic()
+        elapsed = now_mono - last_cycle_mono
+        if elapsed > 600:
+            print(f"  [INFO] Large gap detected ({elapsed:.0f}s) — likely resumed from sleep.")
+            if telegram_enabled():
+                try:
+                    send_telegram_notification(
+                        "PredictionMLBot Resumed",
+                        (
+                            f"Time (UTC):           {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Gap detected:         {elapsed/60:.0f} minutes\n"
+                            f"Status:               Bot resumed after sleep/hibernation."
+                        ),
+                    )
+                    print("  Resume Telegram notification sent.")
+                except Exception as exc:
+                    print(f"  [ERROR] Failed to send resume notification: {exc}")
+        last_cycle_mono = now_mono
+
         try:
-            run_prediction(m)
+            run_prediction(m, target_boundary)
         except Exception as exc:
             traceback.print_exc()
             send_error_notification(exc)
