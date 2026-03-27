@@ -9,6 +9,17 @@ from Trade.auth import get_clob_client
 from Trade.market import get_btc_5m_market
 
 
+class OrderRejectedError(Exception):
+    """Raised when the CLOB API returns HTTP 200 but success=false.
+
+    This means the order was NOT placed, so retrying is safe.
+    """
+    def __init__(self, error_msg: str, response: dict):
+        self.error_msg = error_msg
+        self.response = response
+        super().__init__(f"Order rejected: {error_msg}")
+
+
 # Defaults (can be overridden per call)
 DEFAULT_PRICE = 0.50   # 50 cents per share
 DEFAULT_SIZE = 5       # 5 shares
@@ -94,6 +105,11 @@ def place_btc_5m_order(
             resp = client.create_and_post_order(order_args, options)
         else:
             raise
+
+    # The CLOB API returns HTTP 200 for both accepted and rejected orders.
+    # A rejected order has success=false — the order was NOT placed.
+    if isinstance(resp, dict) and resp.get("success") is False:
+        raise OrderRejectedError(resp.get("errorMsg", "unknown"), resp)
 
     return {
         "response": resp,

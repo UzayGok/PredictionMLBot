@@ -30,14 +30,16 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 from Predict.data_fetcher import fetch_candles, current_boundary_utc
 from Training.features import calculate_features
 from Predict.predict_live import predict_two_stage, MAG_PROBA_THR, DIR_CONF_THR, LIVE_CANDLE_LIMIT
-from Trade.order import place_btc_5m_order, warm_client
+from Trade.order import place_btc_5m_order, warm_client, OrderRejectedError
 from Trade.auth import get_clob_client
 from Trade.market import get_btc_5m_market
+from py_clob_client.exceptions import PolyApiException
 
 # Notification config from .env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-ALLOWED_TELEGRAM_CHAT_IDS = {TELEGRAM_CHAT_ID} if TELEGRAM_CHAT_ID else set()
+_raw_chat_ids = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_IDS = [cid.strip() for cid in _raw_chat_ids.split(",") if cid.strip()]
+ALLOWED_TELEGRAM_CHAT_IDS = set(TELEGRAM_CHAT_IDS)
 
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").strip().lower() == "true"
 TRADE_PRICE = float(os.getenv("TRADE_PRICE", "0.50"))
@@ -114,7 +116,7 @@ def acquire_single_instance_lock() -> bool:
 
 
 def telegram_enabled() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS)
 
 
 def email_enabled() -> bool:
@@ -173,8 +175,10 @@ def format_signal_message(
     )
 
 
-def send_telegram_message(subject: str, body: str, chat_id: str = TELEGRAM_CHAT_ID) -> None:
+def send_telegram_message(subject: str, body: str, chat_id: str = "") -> None:
     """Send a plain-text Telegram message via the Bot API."""
+    if not chat_id:
+        raise ValueError("chat_id is required")
     validate_telegram_target(chat_id)
     response = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -188,22 +192,24 @@ def send_telegram_message(subject: str, body: str, chat_id: str = TELEGRAM_CHAT_
 
 
 def send_telegram_notification(subject: str, body: str) -> None:
-    """Send a Telegram notification if Telegram is configured."""
+    """Send a Telegram notification to ALL configured chats."""
     if not telegram_enabled():
         return
-    send_telegram_message(subject, body)
+    for chat_id in TELEGRAM_CHAT_IDS:
+        send_telegram_message(subject, body, chat_id=chat_id)
 
 
 def send_telegram_async(subject: str, body: str) -> None:
-    """Fire-and-forget Telegram notification in a background thread."""
+    """Fire-and-forget Telegram notification to ALL chats in background threads."""
     if not telegram_enabled():
         return
-    def _send():
-        try:
-            send_telegram_message(subject, body)
-        except Exception as exc:
-            print(f"           [ERROR] Telegram async failed: {exc}")
-    threading.Thread(target=_send, daemon=True).start()
+    for chat_id in TELEGRAM_CHAT_IDS:
+        def _send(cid=chat_id):
+            try:
+                send_telegram_message(subject, body, chat_id=cid)
+            except Exception as exc:
+                print(f"           [ERROR] Telegram async failed (chat {cid}): {exc}")
+        threading.Thread(target=_send, daemon=True).start()
 
 
 def send_error_notification(exc: Exception) -> None:
@@ -235,7 +241,7 @@ def send_startup_notification() -> bool:
         "PredictionMLBot Started",
         (
             f"Time (UTC):           {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Telegram chat:        {TELEGRAM_CHAT_ID}\n"
+            f"Telegram chats:       {', '.join(TELEGRAM_CHAT_IDS)}\n"
             f"Thresholds:           mag >= {MAG_PROBA_THR:.0%}, dir >= {DIR_CONF_THR:.0%}\n"
             f"Status:               Scheduler started and waiting for the next 5-minute boundary."
         ),
@@ -328,6 +334,7 @@ def run_prediction(m: dict, target_boundary: datetime.datetime) -> None:
     candle_close = last_candle_open + datetime.timedelta(minutes=5)
     pred_open = candle_close
     pred_close = pred_open + datetime.timedelta(minutes=5)
+    open_price = df["open"].iloc[-1]
     price = df["close"].iloc[-1]
 
     # Deterministic boundary epoch from candle data (immune to local clock drift)
@@ -360,13 +367,54 @@ def run_prediction(m: dict, target_boundary: datetime.datetime) -> None:
 
         # --- SPEED: Place order FIRST, notify after ---
         if TRADING_ENABLED:
-            try:
-                order = place_btc_5m_order(
-                    direction=result['signal'],
-                    price=TRADE_PRICE,
-                    size=TRADE_SIZE,
-                    boundary_epoch=pred_boundary_epoch,
-                )
+            order = None
+            for attempt in range(1, 4):  # up to 3 attempts
+                try:
+                    order = place_btc_5m_order(
+                        direction=result['signal'],
+                        price=TRADE_PRICE,
+                        size=TRADE_SIZE,
+                        boundary_epoch=pred_boundary_epoch,
+                    )
+                    break  # success
+                except (ConnectionError, requests.ConnectionError,
+                        requests.Timeout, requests.HTTPError,
+                        LookupError, OrderRejectedError) as exc:
+                    # These errors happen BEFORE the order is submitted to
+                    # the exchange (market lookup or connect phase), so
+                    # retrying is safe — no double-order risk.
+                    if attempt < 3:
+                        print(f"           [WARN] Order attempt {attempt} failed (pre-submit): {exc} — retrying...")
+                        time.sleep(1)
+                    else:
+                        print(f"           [ERROR] Order failed after {attempt} attempts: {exc}")
+                        send_telegram_async("Order FAILED", f"After {attempt} attempts: {exc}")
+                except PolyApiException as exc:
+                    # PolyApiException with status_code >= 400 means the CLOB
+                    # server explicitly rejected the order — safe to retry.
+                    # status_code in 2xx/3xx range (e.g. 201) means the order
+                    # may have been ACCEPTED — do NOT retry.
+                    # status_code=None means a network error during the POST —
+                    # the order MAY have been accepted before the connection
+                    # dropped — do NOT retry.
+                    if exc.status_code is not None and exc.status_code >= 400 and attempt < 3:
+                        print(f"           [WARN] Order attempt {attempt} rejected (HTTP {exc.status_code}): {exc} — retrying...")
+                        time.sleep(1)
+                    elif exc.status_code is not None and exc.status_code >= 400:
+                        print(f"           [ERROR] Order rejected after {attempt} attempts (HTTP {exc.status_code}): {exc}")
+                        send_telegram_async("Order FAILED", f"Rejected after {attempt} attempts: {exc}")
+                    else:
+                        print(f"           [ERROR] Order may be placed (HTTP {exc.status_code}): {exc}")
+                        send_telegram_async("Order AMBIGUOUS", f"Attempt {attempt}, HTTP {exc.status_code}: {exc}")
+                        break
+                except Exception as exc:
+                    # Unknown error — assume order may have been placed.
+                    # Do NOT retry to avoid double orders.
+                    print(f"           [ERROR] Order failed (unknown, no retry): {exc}")
+                    send_telegram_async("Order FAILED (no retry)", str(exc))
+                    break
+
+            if order is not None:
                 order_resp = order['response']
                 print(f"           Order placed → {order['direction']} @ ${order['price']:.2f} x {order['size']:.0f}")
                 print(f"           Market: {order['market_slug']}")
@@ -381,13 +429,10 @@ def run_prediction(m: dict, target_boundary: datetime.datetime) -> None:
                     f"Status:               {order_resp.get('status', 'N/A')}"
                 )
                 send_telegram_async("Order Placed", order_body)
-            except Exception as exc:
-                print(f"           [ERROR] Order placement failed: {exc}")
-                send_telegram_async("Order FAILED", str(exc))
 
         # Non-blocking BET notification
         send_telegram_async(subject, body)
-        print(f"           Telegram queued → chat {TELEGRAM_CHAT_ID}")
+        print(f"           Telegram queued → {len(TELEGRAM_CHAT_IDS)} chat(s)")
 
         if email_enabled():
             try:
@@ -399,10 +444,10 @@ def run_prediction(m: dict, target_boundary: datetime.datetime) -> None:
         if telegram_enabled():
             mag_label = "BIG" if result['mag_proba'] >= MAG_PROBA_THR else "SMALL"
             send_telegram_async(
-                f"{mag_label}, SKIP, {result['signal']}, {result['dir_conf']:.2%}",
+                f"{mag_label}, SKIP, {result['signal']}, {result['dir_conf']:.2%}, ${open_price:,.2f}",
                 "",
             )
-            print(f"           Telegram skip queued → chat {TELEGRAM_CHAT_ID}")
+            print(f"           Telegram skip queued → {len(TELEGRAM_CHAT_IDS)} chat(s)")
 
 
 def next_boundary_info() -> tuple:
@@ -427,17 +472,18 @@ def main():
 
     if not (telegram_enabled() or email_enabled()):
         raise ValueError(
-            "No notification channel configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, "
+            "No notification channel configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (comma-separated), "
             "or provide the EMAIL_* settings in .env."
         )
 
     if telegram_enabled():
-        validate_telegram_target(TELEGRAM_CHAT_ID)
+        for cid in TELEGRAM_CHAT_IDS:
+            validate_telegram_target(cid)
 
     print("=" * 70)
     print("  BTC 5-min Prediction Scheduler")
     if telegram_enabled():
-        print(f"  Telegram alerts → chat {TELEGRAM_CHAT_ID}")
+        print(f"  Telegram alerts → {len(TELEGRAM_CHAT_IDS)} chat(s): {', '.join(TELEGRAM_CHAT_IDS)}")
     if email_enabled():
         print(f"  Email alerts → {EMAIL_TO}")
     print(f"  Thresholds: mag >= {MAG_PROBA_THR:.0%}, dir >= {DIR_CONF_THR:.0%}")

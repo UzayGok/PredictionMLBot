@@ -27,7 +27,7 @@ from Training.features import calculate_features
 # ---------------------------------------------------------------------------
 
 MAG_PROBA_THR = 0.50
-DIR_CONF_THR = 0.55
+DIR_CONF_THR = 0.54
 LIVE_CANDLE_LIMIT = 2500
 
 
